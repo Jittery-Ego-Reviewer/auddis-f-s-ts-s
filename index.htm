@@ -1,0 +1,426 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+
+// --- STIMULI DATA ---
+const STIMULI = {
+  f_s: {
+    title: "花 (/f/) vs. 蛇 (/s/)",
+    pairs: [
+      ["花", "沙"], ["發", "撒"], ["法", "殺"], ["火", "鎖"], 
+      ["房", "爽"], ["複", "叔"], ["墳", "神"]
+    ]
+  },
+  ts_s: {
+    title: "之 (/ts/) vs. 蛇 (/s/)",
+    pairs: [
+      ["紙", "屎"], ["紫", "屎"], ["子", "屎"], ["張", "箱"], 
+      ["中", "鬆"], ["真", "新"], ["爭", "生"], ["執", "濕"], 
+      ["只", "屎"], ["左", "鎖"], ["這", "瀉"], ["周", "收"], 
+      ["進", "信"], ["針", "心"], ["積", "骰"], ["枝", "詩"], 
+      ["之", "詩"], ["豬", "書"], ["主", "鼠"], ["組", "數"], 
+      ["竹", "叔"], ["祝", "叔"]
+    ]
+  }
+};
+
+const PRESENTS = ['🎁', '🧸', '🎮', '⚽', '🍬', '🤖', '📚'];
+const BOMB = '💣';
+const MAX_ROUNDS = 10;
+
+// --- AUDIO SYNTHESIS ---
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+const playTone = (freq, type, duration, vol = 0.1) => {
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+};
+
+const sounds = {
+  catch: () => playTone(600, 'sine', 0.1, 0.2),
+  bomb: () => {
+    playTone(100, 'square', 0.3, 0.3);
+    playTone(80, 'sawtooth', 0.4, 0.3);
+  },
+  correct: () => {
+    playTone(440, 'sine', 0.1, 0.2);
+    setTimeout(() => playTone(554, 'sine', 0.1, 0.2), 100);
+    setTimeout(() => playTone(659, 'sine', 0.2, 0.2), 200);
+  },
+  incorrect: () => {
+    playTone(300, 'triangle', 0.2, 0.3);
+    setTimeout(() => playTone(250, 'triangle', 0.3, 0.3), 150);
+  }
+};
+
+// --- MAIN COMPONENT ---
+export default function App() {
+  const [screen, setScreen] = useState('home'); // home, instructions, game, end
+  const [goal, setGoal] = useState(null);
+  const [score, setScore] = useState(0);
+  const [round, setRound] = useState(0);
+  
+  // Game State
+  const [isPaused, setIsPaused] = useState(false);
+  const [quizPair, setQuizPair] = useState(null);
+  const [caughtItem, setCaughtItem] = useState(null);
+  const [stack, setStack] = useState([]);
+  const [feedbackMsg, setFeedbackMsg] = useState(null);
+
+  // Engine Refs
+  const basketRef = useRef({ x: 50 });
+  const itemsRef = useRef([]);
+  const gameLoopRef = useRef(null);
+  const [renderTick, setRenderTick] = useState(0);
+
+  // --- GAME ENGINE ---
+  const spawnWave = useCallback(() => {
+    const newItems = [];
+    const numPresents = Math.floor(Math.random() * 2) + 1; // 1 or 2 presents
+    const positions = [15, 35, 50, 65, 85].sort(() => 0.5 - Math.random()).slice(0, numPresents + 1);
+    
+    // Add Bomb
+    newItems.push({
+      id: Math.random().toString(),
+      type: 'bomb',
+      emoji: BOMB,
+      x: positions[0],
+      y: -10,
+      speed: 0.8 + Math.random() * 0.4
+    });
+
+    // Add Presents
+    for (let i = 0; i < numPresents; i++) {
+      newItems.push({
+        id: Math.random().toString(),
+        type: 'present',
+        emoji: PRESENTS[Math.floor(Math.random() * PRESENTS.length)],
+        x: positions[i + 1],
+        y: -10 - (Math.random() * 10),
+        speed: 0.6 + Math.random() * 0.5
+      });
+    }
+    
+    itemsRef.current = newItems;
+  }, []);
+
+  const handleGameLoop = useCallback(() => {
+    if (isPaused || screen !== 'game') return;
+
+    let items = itemsRef.current;
+    let newItems = [];
+    let hitPresent = null;
+    let hitBomb = false;
+
+    const basketLeft = basketRef.current.x - 12;
+    const basketRight = basketRef.current.x + 12;
+    const stackHeight = stack.length * 5;
+    const catchY = 80 - stackHeight; // Adjusted for stack
+
+    for (let item of items) {
+      item.y += item.speed;
+
+      // Collision Detection
+      const isCatchingLevel = item.y > catchY && item.y < catchY + 10;
+      const isWithinWidth = item.x > basketLeft && item.x < basketRight;
+
+      if (isCatchingLevel && isWithinWidth) {
+        if (item.type === 'bomb') {
+          hitBomb = true;
+        } else if (item.type === 'present' && !hitPresent) {
+          hitPresent = item;
+        }
+      } else if (item.y < 120) {
+        newItems.push(item); // Keep falling
+      }
+    }
+
+    if (hitBomb) {
+      sounds.bomb();
+      setFeedbackMsg({ text: 'BOOM!', type: 'bomb' });
+      setTimeout(() => setFeedbackMsg(null), 1000);
+      itemsRef.current = []; // Clear wave
+      spawnWave();
+    } else if (hitPresent) {
+      sounds.catch();
+      itemsRef.current = newItems.filter(i => i.id !== hitPresent.id);
+      triggerQuiz(hitPresent);
+    } else {
+      itemsRef.current = newItems;
+      if (newItems.length === 0) spawnWave();
+    }
+
+    setRenderTick(t => t + 1);
+  }, [isPaused, screen, stack.length, spawnWave]);
+
+  useEffect(() => {
+    if (screen === 'game' && !isPaused) {
+      gameLoopRef.current = setInterval(handleGameLoop, 20);
+    }
+    return () => clearInterval(gameLoopRef.current);
+  }, [screen, isPaused, handleGameLoop]);
+
+  // --- CONTROLS ---
+  const handlePointerMove = (e) => {
+    if (isPaused || screen !== 'game') return;
+    let clientX = e.clientX;
+    if (e.touches && e.touches.length > 0) {
+      clientX = e.touches[0].clientX;
+    }
+    const container = e.currentTarget.getBoundingClientRect();
+    const pct = ((clientX - container.left) / container.width) * 100;
+    basketRef.current.x = Math.max(10, Math.min(90, pct));
+    setRenderTick(t => t + 1);
+  };
+
+  // --- QUIZ LOGIC ---
+  const triggerQuiz = (item) => {
+    setIsPaused(true);
+    setCaughtItem(item);
+    
+    // Pick random pair
+    const pairs = STIMULI[goal].pairs;
+    const pair = pairs[Math.floor(Math.random() * pairs.length)];
+    
+    // Shuffle
+    const shuffled = Math.random() > 0.5 ? [pair[0], pair[1]] : [pair[1], pair[0]];
+    setQuizPair(shuffled);
+  };
+
+  const handleTherapistFeedback = (isCorrect) => {
+    if (isCorrect) {
+      sounds.correct();
+      setScore(s => s + 1);
+      setStack(s => [...s, caughtItem.emoji]);
+      setFeedbackMsg({ text: '答對了! YAY!', type: 'correct' });
+    } else {
+      sounds.incorrect();
+      setFeedbackMsg({ text: '再接再厲!', type: 'incorrect' });
+    }
+
+    setTimeout(() => {
+      setFeedbackMsg(null);
+      const nextRound = round + 1;
+      setRound(nextRound);
+      
+      if (nextRound >= MAX_ROUNDS) {
+        setScreen('end');
+      } else {
+        setIsPaused(false);
+      }
+    }, 1500);
+    
+    setQuizPair(null);
+  };
+
+  // --- RENDER HELPERS ---
+  const startGoal = (selectedGoal) => {
+    setGoal(selectedGoal);
+    setScreen('instructions');
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  };
+
+  const startGame = () => {
+    setScore(0);
+    setRound(0);
+    setStack([]);
+    itemsRef.current = [];
+    spawnWave();
+    setScreen('game');
+    setIsPaused(false);
+  };
+
+  // Comic style classes
+  const comicBorder = "border-4 border-black rounded-xl shadow-[8px_8px_0px_#000]";
+  const comicBtn = `${comicBorder} font-black uppercase transform transition active:translate-y-2 active:shadow-[2px_2px_0px_#000] hover:-translate-y-1 hover:shadow-[10px_10px_0px_#000]`;
+
+  return (
+    <div className="min-h-screen select-none bg-yellow-300 font-sans"
+         style={{ backgroundImage: 'radial-gradient(#fbbf24 2px, transparent 2px)', backgroundSize: '30px 30px' }}>
+      
+      {/* --- HOME SCREEN --- */}
+      {screen === 'home' && (
+        <div className="flex flex-col items-center justify-center min-h-screen p-4 text-center">
+          <h1 className="text-5xl md:text-7xl font-black mb-12 text-white drop-shadow-[4px_4px_0px_#000] tracking-wider" 
+              style={{ WebkitTextStroke: '2px black' }}>
+            聲母辨認大挑戰<br/><span className="text-3xl">Speech Sound Challenge</span>
+          </h1>
+          <div className="flex flex-col gap-6 w-full max-w-md">
+            <button 
+              onClick={() => startGoal('f_s')}
+              className={`bg-cyan-400 p-6 text-3xl ${comicBtn} text-white`}
+              style={{ WebkitTextStroke: '1px black' }}>
+              花 vs. 蛇<br/><span className="text-xl">(/f/ vs /s/)</span>
+            </button>
+            <button 
+              onClick={() => startGoal('ts_s')}
+              className={`bg-pink-400 p-6 text-3xl ${comicBtn} text-white`}
+              style={{ WebkitTextStroke: '1px black' }}>
+              之 vs. 蛇<br/><span className="text-xl">(/ts/ vs /s/)</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* --- INSTRUCTIONS SCREEN --- */}
+      {screen === 'instructions' && (
+        <div className="flex flex-col items-center justify-center min-h-screen p-6">
+          <div className={`bg-white p-8 max-w-lg w-full text-center ${comicBorder}`}>
+            <h2 className="text-4xl font-black mb-6 text-blue-600">遊戲玩法</h2>
+            <ul className="text-2xl text-left space-y-4 mb-8 font-bold text-gray-800">
+              <li>👋 左右滑動控制籃子</li>
+              <li>🎁 接住掉下來的禮物</li>
+              <li>💣 小心避開炸彈！</li>
+              <li>👂 聽家長/治療師讀出字詞，選出正確的答案來疊高禮物！</li>
+            </ul>
+            <button onClick={startGame} className={`bg-green-500 text-white p-4 text-3xl w-full ${comicBtn}`}>
+              開始遊戲! (START)
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* --- GAME SCREEN --- */}
+      {screen === 'game' && (
+        <div 
+          className={`relative w-full h-screen overflow-hidden cursor-crosshair ${!isPaused ? 'touch-none' : ''}`}
+          onMouseMove={handlePointerMove}
+          onTouchMove={handlePointerMove}
+        >
+          {/* Header Stats */}
+          <div className="absolute top-4 left-4 right-4 flex justify-between items-center z-10 pointer-events-none">
+            <div className={`bg-white px-4 py-2 text-2xl font-black ${comicBorder}`}>
+              回合: {round}/{MAX_ROUNDS}
+            </div>
+            <div className={`bg-white px-4 py-2 text-2xl font-black text-red-600 ${comicBorder}`}>
+              分數: {score}
+            </div>
+          </div>
+
+          {/* Falling Items */}
+          {itemsRef.current.map(item => (
+            <div 
+              key={item.id}
+              className="absolute text-5xl md:text-6xl"
+              style={{
+                left: `${item.x}%`,
+                top: `${item.y}%`,
+                transform: 'translate(-50%, -50%)',
+                filter: 'drop-shadow(3px 3px 0px rgba(0,0,0,0.5))'
+              }}
+            >
+              {item.emoji}
+            </div>
+          ))}
+
+          {/* Basket and Stack */}
+          <div 
+            className="absolute bottom-[10%]"
+            style={{ left: `${basketRef.current.x}%`, transform: 'translateX(-50%)' }}
+          >
+            {/* Stacked Presents */}
+            <div className="relative w-full flex flex-col-reverse items-center justify-end pointer-events-none">
+               {stack.map((emoji, idx) => (
+                 <div key={idx} className="text-5xl md:text-6xl absolute" 
+                      style={{ bottom: `${(idx * 40) + 40}px`, zIndex: stack.length - idx, filter: 'drop-shadow(2px 2px 0px rgba(0,0,0,0.8))' }}>
+                   {emoji}
+                 </div>
+               ))}
+               {/* The Basket */}
+               <div className="text-7xl md:text-8xl mt-10 relative z-50 filter drop-shadow-[0_10px_0_rgba(0,0,0,0.3)]">
+                 🧺
+               </div>
+            </div>
+          </div>
+
+          {/* Quiz Overlay */}
+          {isPaused && quizPair && !feedbackMsg && (
+            <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+              <div className={`bg-yellow-100 p-4 md:p-10 w-full max-w-3xl flex flex-col items-center max-h-full overflow-y-auto ${comicBorder}`}>
+                <h2 className="text-3xl md:text-5xl font-black mb-6 text-center text-blue-700 tracking-wide" style={{ WebkitTextStroke: '1px white' }}>
+                  請指出家長/治療師說的字
+                </h2>
+                
+                <div className="flex justify-center gap-4 md:gap-8 w-full mb-8 md:mb-12">
+                  <div className={`flex-1 aspect-[4/3] md:aspect-square bg-white flex items-center justify-center text-6xl md:text-8xl font-black text-black ${comicBorder} cursor-pointer hover:bg-yellow-200 transition-colors`}>
+                    {quizPair[0]}
+                  </div>
+                  <div className={`flex-1 aspect-[4/3] md:aspect-square bg-white flex items-center justify-center text-6xl md:text-8xl font-black text-black ${comicBorder} cursor-pointer hover:bg-yellow-200 transition-colors`}>
+                    {quizPair[1]}
+                  </div>
+                </div>
+
+                {/* Therapist Controls */}
+                <div className="w-full bg-gray-800 p-4 rounded-xl border-4 border-black shrink-0">
+                  <p className="text-yellow-400 font-bold text-center mb-4 text-base md:text-xl tracking-widest">--- 家長/治療師專用 ---</p>
+                  <div className="flex justify-center gap-2 md:gap-4">
+                    <button 
+                      onClick={() => handleTherapistFeedback(true)}
+                      className="flex-1 bg-green-500 text-white font-black text-xl md:text-3xl py-3 md:py-4 border-4 border-black rounded-xl shadow-[4px_4px_0px_#000] active:translate-y-1 active:shadow-none"
+                    >
+                      ✅ 答對 (Correct)
+                    </button>
+                    <button 
+                      onClick={() => handleTherapistFeedback(false)}
+                      className="flex-1 bg-red-500 text-white font-black text-xl md:text-3xl py-3 md:py-4 border-4 border-black rounded-xl shadow-[4px_4px_0px_#000] active:translate-y-1 active:shadow-none"
+                    >
+                      ❌ 錯了 (Incorrect)
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Feedback Overlay */}
+          {feedbackMsg && (
+            <div className="absolute inset-0 flex items-center justify-center z-50 pointer-events-none">
+              <div 
+                className={`text-6xl md:text-8xl font-black p-8 transform rotate-[-10deg] animate-bounce ${comicBorder} ${feedbackMsg.type === 'correct' ? 'bg-green-400 text-white' : feedbackMsg.type === 'bomb' ? 'bg-red-600 text-yellow-300' : 'bg-orange-400 text-white'}`}
+                style={{ WebkitTextStroke: '2px black' }}
+              >
+                {feedbackMsg.text}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* --- END SCREEN --- */}
+      {screen === 'end' && (
+        <div className="flex flex-col items-center justify-center min-h-screen p-6 text-center">
+          <div className={`bg-white p-10 max-w-lg w-full ${comicBorder}`}>
+            <h1 className="text-6xl font-black text-blue-600 mb-6 uppercase">遊戲結束!</h1>
+            
+            <div className="text-9xl mb-6 drop-shadow-[0_10px_0_rgba(0,0,0,0.2)]">
+              {score >= 8 ? '🏆' : score >= 5 ? '⭐' : '👍'}
+            </div>
+            
+            <p className="text-4xl font-bold mb-2">你的總分是:</p>
+            <p className="text-6xl font-black text-red-500 mb-8">{score} / {MAX_ROUNDS}</p>
+            
+            <p className="text-2xl font-bold text-gray-600 mb-8">
+              {score >= 8 ? '太棒了！你是聲母辨認大師！' : score >= 5 ? '做得好！繼續努力！' : '很好的嘗試！下次會更好！'}
+            </p>
+            
+            <div className="flex flex-col gap-4">
+              <button onClick={startGame} className={`bg-cyan-400 text-white p-4 text-3xl w-full ${comicBtn}`}>
+                🔄 再玩一次
+              </button>
+              <button onClick={() => setScreen('home')} className={`bg-gray-300 text-black p-4 text-2xl w-full ${comicBtn}`}>
+                🏠 回到主頁
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
